@@ -1,203 +1,194 @@
 #include <Arduino.h>
 #include "irda.h"
 #include "oled.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
-#define BUF_SIZE 1024
+#define BUF_SIZE 1024  // Réduction de la taille du buffer pour économiser de la mémoire
 
 // Pin configuration for IRDA
 #define IRDA_TX_PIN 32
 #define IRDA_RX_PIN 35
 
+// Définir la pwm pour la LED
+#define PWM_CHANNEL 0
+#define PWM_FREQUENCY 5000
+#define PWM_RESOLUTION 8  // Pour une valeur de 0 à 255
+
 // LED Pin
 #define LED_PIN 33
 
+// Définir l'intervalle d'envoi pour le radar
+#define SEND_INTERVAL 3000  // Interval de temps pour envoyer un paquet IRDA
+
+const String CMD_GO = "GO";
+const String CMD_SLOW = "SLOW";
+const String CMD_STOP = "STOP";
+
 // Vitesse de la capsule (analogique)
-int VITESSE_CAPSULE = 0; // De 0 à 255 pour une sortie analogique (PWM)
+int VITESSE_CAPSULE = 0;
 
 // Buffer for incoming data
 char irda_buffer[BUF_SIZE];
 
-// Mutex pour OLED
-bool oled_busy = false;
+// Sémaphores pour la gestion des priorités
+SemaphoreHandle_t oledMutex;  // Mutex pour l'accès à l'écran OLED
+SemaphoreHandle_t prioritySemaphore; // Sémaphore pour gérer la priorité entre Serial et IRDA
 
-// Intervalle d'envoi des paquets (en ms)
-#define SEND_INTERVAL 5000
+
+
+// Déclaration globale des variables partagées
+char last_message[BUF_SIZE] = ""; 
+int last_speed = 0;  
+String last_command = "";
 
 // Fonction pour ajuster la vitesse PWM
 void vitesse_pwm(int vitesse) {
-    // Map la vitesse entre 0 et 5 à une valeur de 0 à 255 pour PWM
     int pwm_value = map(vitesse, 0, 5, 0, 255);
-    analogWrite(LED_PIN, pwm_value);  // Appliquer la vitesse via PWM
+    ledcWrite(PWM_CHANNEL, pwm_value);
 }
 
-// Fonction d'affichage sur OLED avec verrouillage
+// Fonction d'affichage sur OLED avec mutex
 void afficher_oled(int last_speed, String last_command) {
+    static int last_displayed_speed;  
+    static String last_displayed_command;
 
-    // Variables pour suivre les dernières valeurs affichées
-    static int last_displayed_speed;  // Dernière vitesse affichée
-    static String last_displayed_command;  // Dernière commande affichée
+    // Prendre le mutex pour accéder à l'OLED
+    if (xSemaphoreTake(oledMutex, (TickType_t) 10) == pdTRUE) {
+        
+        // Mettre à jour l'écran seulement si la vitesse ou la commande a changé
+        if (last_speed != last_displayed_speed || last_command != last_displayed_command) {
+            // Clear l'écran pour éviter les doublons
+            oled_clear();
 
-    // Attendre que l'écran soit libre
-    while (oled_busy) {
-        delay(10);  // Attendre un peu avant de réessayer
+            // Afficher la dernière vitesse reçue
+            char display_message[30];
+            sprintf(display_message, "Vitesse: %d", last_speed);
+            oled_display_text(display_message, 0, 16);
+
+            // Afficher la dernière consigne reçue via Serial
+            oled_display_text("Consigne:", 0, 32);
+            oled_display_text(last_command.c_str(), 0, 48);
+
+            // Mettre à jour les dernières valeurs affichées
+            last_displayed_speed = last_speed;
+            last_displayed_command = last_command;
+        }
+
+        // Libérer le mutex après l'affichage
+        xSemaphoreGive(oledMutex);
     }
-
-    // Verrouiller l'accès à l'écran OLED
-    oled_busy = true;
-
-    // Mettre à jour l'écran seulement si la vitesse ou la commande a changé
-    if (last_speed != last_displayed_speed || last_command != last_displayed_command) {
-        // Clear l'écran pour éviter les doublons
-        oled_clear();
-
-        // Afficher la dernière vitesse reçue
-        char display_message[30];
-        sprintf(display_message, "Vitesse: %d", last_speed);
-        oled_display_text(display_message, 0, 16);
-
-        // Afficher la dernière consigne reçue via Serial
-        oled_display_text("Consigne:", 0, 32);
-        oled_display_text(last_command.c_str(), 0, 48);
-
-        // Mettre à jour les dernières valeurs affichées
-        last_displayed_speed = last_speed;
-        last_displayed_command = last_command;
-    }
-
-    // Libérer l'accès à l'écran OLED
-    oled_busy = false;
 }
 
 // Fonction pour gérer la réception IRDA
 void handle_irda() {
-    // Stocke le dernier message affiché pour éviter les doublons
-    static char last_message[BUF_SIZE] = "";
-    static int last_speed = 0;  // Dernière vitesse reçue
-    static String last_command = "";  // Dernière consigne reçue (Serial)
-
-    // Vérifier si l'OLED est disponible
-    if (!oled_busy) {
+    if (xSemaphoreTake(prioritySemaphore, (TickType_t) 10) == pdTRUE) {
         // Tenter de recevoir un paquet IRDA
         irda_receive_packet(irda_buffer, BUF_SIZE);
 
-        // Si un message IRDA a été reçu et qu'il est différent du précédent
         if (strlen(irda_buffer) > 0 && strcmp(irda_buffer, last_message) != 0) {
-            // Prendre le mutex
-            oled_busy = true;
+            int received_speed = atoi(irda_buffer);
 
-            // Vérifier si le message reçu est un chiffre valide entre 0 et 5
-            int received_speed = atoi(irda_buffer);  // Convertir le message en entier
-
-            // Afficher le message reçu dans le moniteur série
-            Serial.print("Message reçu IRDA: ");
-            Serial.println(received_speed);
-
-            if (received_speed >= 0 && received_speed <= 5) {
-                // Sauvegarder la dernière vitesse
+            if (received_speed >= 0 && received_speed <= 255) {
                 last_speed = received_speed;
-
-                // Ajuster la vitesse via PWM
                 vitesse_pwm(received_speed);
             } else {
-                // Message invalide
                 last_speed = 0;
-                digitalWrite(LED_PIN, LOW); // LED éteinte si message invalide
+                digitalWrite(LED_PIN, LOW); 
             }
 
-            // Sauvegarder le dernier message affiché
             strncpy(last_message, irda_buffer, BUF_SIZE);
 
-            // Vider le irda_buffer
+            // Afficher sur l'OLED la dernière vitesse et la dernière consigne
+            afficher_oled(last_speed, "IRDA");
+
             memset(irda_buffer, 0, BUF_SIZE);
 
-            // Libérer le mutex
-            oled_busy = false;
-
-            // Flush le buffer UART seulement après avoir traité le message
             irda_flush();
         }
+    // Libération du sémaphore pour les autres tâches
+    xSemaphoreGive(prioritySemaphore);
     }
-
-    // Afficher sur l'OLED la dernière vitesse et la dernière consigne seulement si elles ont changé
-    afficher_oled(last_speed, last_command);
 }
 
 // Fonction pour gérer les commandes du port série
 void handle_serial() {
-    // Stocke la dernière commande reçue pour éviter les doublons
-    static String last_command = "";
-
-    // Lire les commandes du port série (GO, SLOW, STOP)
     if (Serial.available() > 0) {
         String command = Serial.readStringUntil('\n');
-        command.trim();  // Nettoyer la chaîne pour éviter les espaces inutiles
+        command.trim(); 
+        
+        // Vérifie si la nouvelle commande est différente de la précédente
+        if (command != last_command) {
+            if (command == "GO") {
 
-        if (command == "GO") {
-            VITESSE_CAPSULE = 255; // Vitesse maximale
-            last_command = "GO";
-            vitesse_pwm(VITESSE_CAPSULE);  // Appliquer la vitesse via PWM
-            Serial.println("GO Command Received");
-        } else if (command == "SLOW") {
-            VITESSE_CAPSULE = 64; // Vitesse réduite
-            last_command = "SLOW";
-            vitesse_pwm(VITESSE_CAPSULE);  // Appliquer la vitesse via PWM
-            Serial.println("SLOW Command Received");
-        } else if (command == "STOP") {
-            VITESSE_CAPSULE = 0; // Arrêter la capsule
-            last_command = "STOP";
-            vitesse_pwm(VITESSE_CAPSULE);  // Appliquer la vitesse via PWM
-            Serial.println("STOP Command Received");
+                VITESSE_CAPSULE = 255;
+                last_command = CMD_GO;
+                // Libère le sémaphore pour permettre la lecture IRDA
+                xSemaphoreGive(prioritySemaphore);
+
+            } else if (command == "SLOW") {
+
+                VITESSE_CAPSULE = 64;
+                last_command = CMD_SLOW;
+                // Prend le sémaphore pour bloquer la lecture IRDA
+                xSemaphoreTake(prioritySemaphore, portMAX_DELAY);
+
+            } else if (command == "STOP") {
+
+                VITESSE_CAPSULE = 0;
+                last_command = CMD_STOP;
+
+                // Prend le sémaphore pour bloquer la lecture IRDA
+                xSemaphoreTake(prioritySemaphore, portMAX_DELAY);
+            }
+            vitesse_pwm(VITESSE_CAPSULE);
+            afficher_oled(VITESSE_CAPSULE, last_command);    
         }
     }
 }
 
 void setup() {
-    // Initialisation du moniteur série
-    Serial.begin(115200);  // Initialisation du port série pour l'affichage dans le moniteur série
+    Serial.begin(115200);  // Initialisation du port série
 
-    // Initialisation de l'écran OLED
-    oled_init();
+    oled_init();  // Initialisation de l'écran OLED
+    irda_init(IRDA_TX_PIN, IRDA_RX_PIN);  // Initialisation de la communication IRDA
 
-    // Initialisation de la communication IRDA
-    irda_init(IRDA_TX_PIN, IRDA_RX_PIN);
-
-    // Initialisation de la LED
     pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW); // LED éteinte au départ
+    digitalWrite(LED_PIN, LOW); 
 
-    // Initialisation de la vitesse PWM
-    vitesse_pwm(VITESSE_CAPSULE);  // Initialiser la vitesse à 0
+    ledcSetup(PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
+    ledcAttachPin(LED_PIN, PWM_CHANNEL);
 
-    // Affichage de l'état initial sur l'OLED
+    vitesse_pwm(VITESSE_CAPSULE);
+
     oled_display_text("Initialisation", 0, 0);
+
+    // Création du mutex pour l'OLED
+    oledMutex = xSemaphoreCreateMutex();
+
+    // Création du sémaphore pour gérer la priorité (initialement donné)
+    prioritySemaphore = xSemaphoreCreateBinary();
+    xSemaphoreGive(prioritySemaphore);  // Par défaut, IRDA est autorisé
+
 }
 
 void loop() {
 #ifdef RADAR
-    // Comportement de l'émetteur
-
-    // Utilisation de millis() pour envoyer toutes les 5 secondes
     static unsigned long last_send_time = 0;
 
-    // Vérifie si l'intervalle est écoulé
     if (millis() - last_send_time >= SEND_INTERVAL) {
+        digitalWrite(LED_PIN, HIGH);
 
-        digitalWrite(LED_PIN, HIGH); // Allumer la LED
+        last_send_time = millis();
 
-        last_send_time = millis(); // Mise à jour du dernier envoi
-
-        // Nettoyer l'affichage pour éviter la persistance
         oled_clear();
 
-        // Création du message avec une vitesse aléatoire entre 0 et 5
-        int random_speed = random(0, 6); // Génère un nombre entre 0 et 5
+        int random_speed = random(0, 256); 
         char message[10];
-        sprintf(message, "%d", random_speed); // Message avec la vitesse
+        sprintf(message, "%d", random_speed);
 
-        // Envoi du paquet
         irda_send_packet(message);
 
-        // Affichage de l'état sur l'OLED
         oled_display_text("Packet Sent", 0, 0);
         oled_display_text(message, 0, 16);
 
@@ -210,8 +201,7 @@ void loop() {
 #endif
 
 #ifdef RECEIVER
-    // Appels séparés pour plus de clarté
-    handle_irda();   // Gérer la réception IRDA
-    handle_serial(); // Gérer les commandes série
+    handle_irda();   
+    handle_serial(); 
 #endif
 }
